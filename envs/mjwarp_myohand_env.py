@@ -259,18 +259,18 @@ class MyoHandPourEnv:
             _Iloc = _R0.T @ _I @ _R0   # inertia about root origin in the BODY frame (free-joint angular dofs are body-frame)
             self._root_damp_np = (_damp * _tm, (_damp * _Iloc).astype(np.float32))
         print(f"[wrist] hand_gravity={_hand_gravity} (0=compensated) root_damping={_damp} coeffs={None if self._root_damp_np is None else (round(float(self._root_damp_np[0]), 2), np.round(np.diag(self._root_damp_np[1]), 3).tolist())}", flush=True)
-        _lim_tc = float(os.environ.get("MYOHAND_LIMIT_TC", "0.00833"))
+        _lim_tc = float(os.environ.get("MYOHAND_LIMIT_TC", "0"))
         if _lim_tc > 0:
             for _j in range(self.mj_model.njnt):
                 if self.mj_model.jnt_limited[_j] and self.mj_model.jnt_type[_j] in (2, 3):
                     self.mj_model.jnt_solref[_j] = [_lim_tc, 1.0]
         print(f"[limits] joint limit solref timeconst={'default (0.02)' if _lim_tc <= 0 else _lim_tc}")
-        _ip_flex = float(os.environ.get("MYOHAND_IP_MAX_FLEX_DEG", "35"))
+        _ip_flex = float(os.environ.get("MYOHAND_IP_MAX_FLEX_DEG", "0"))
         if _ip_flex > 0:
             _j = mujoco.mj_name2id(self.mj_model, mujoco.mjtObj.mjOBJ_JOINT, "ip_flexion_r")
             self.mj_model.jnt_range[_j, 0] = -np.radians(_ip_flex)
             print(f"[limits] ip_flexion_r max flexion set to {_ip_flex} deg")
-        _mp_max = float(os.environ.get("MYOHAND_MP_MAX_DEG", "22"))
+        _mp_max = float(os.environ.get("MYOHAND_MP_MAX_DEG", "30"))
         if _mp_max > 0:
             _j = mujoco.mj_name2id(self.mj_model, mujoco.mjtObj.mjOBJ_JOINT, "mp_flexion_r")
             self.mj_model.jnt_range[_j, 1] = np.radians(_mp_max)
