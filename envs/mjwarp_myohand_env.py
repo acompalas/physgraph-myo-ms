@@ -166,7 +166,11 @@ class MyoHandPourEnv:
         self.headless = headless
 
         repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        demo_path = os.path.join(repo_root, "assets/retargeted/1292e_training_demo.pkl")
+        if os.environ.get("MYOHAND_MUG_PRESET") == "small":
+            os.environ.setdefault("MYOHAND_SRC_MUG_SCALE_XY", "0.879")
+            os.environ.setdefault("MYOHAND_DEMO", "1292e_training_demo_smallmug_v1.pkl")
+            os.environ.setdefault("MYOHAND_SRC_BPS", "1292e_src_mug_bps_small.pkl")
+        demo_path = os.path.join(repo_root, "assets/retargeted", os.environ.get("MYOHAND_DEMO", "1292e_training_demo.pkl"))
         with open(demo_path, "rb") as f:
             demo = pickle.load(f)
         self.rh_demo = demo["rh"]
@@ -212,7 +216,18 @@ class MyoHandPourEnv:
         # mass = 200 * summed collision-piece volume (src 3.395e-4 m^3 -> 0.068 kg, dst 2.338e-4 m^3 -> 0.047 kg).
         # The XML masses (1.076 / 0.719 kg) are ~16x too heavy; ratios below map them to those targets.
         _mass_scale = float(os.environ.get("MYOHAND_MUG_MASS_SCALE", "1.0"))
-        for spec, _ratio in ((mug_src, 0.0631), (mug_dst, 0.0651)):
+        _sxy = float(os.environ.get("MYOHAND_SRC_MUG_SCALE_XY", "1.0"))
+        _sz = float(os.environ.get("MYOHAND_SRC_MUG_SCALE_Z", "1.0"))
+        if _sxy != 1.0 or _sz != 1.0:
+            _ms = np.array([_sxy, _sxy, _sz])
+            for _m in mug_src.meshes:
+                _m.scale = _ms
+            for _g in mug_src.geoms:
+                _g.pos = np.array(_g.pos) * _ms
+            for _b in mug_src.bodies:
+                _b.ipos = np.array(_b.ipos) * _ms
+            print(f"[mug] poured mug scaled xy={_sxy} z={_sz} (mass x{_sxy**2*_sz:.3f})")
+        for spec, _ratio in ((mug_src, 0.0631 * _sxy**2 * _sz), (mug_dst, 0.0651)):
             for _b in spec.bodies:
                 if _b.mass > 0:
                     _m1 = min(0.5, _b.mass * _ratio * _mass_scale)
@@ -423,7 +438,7 @@ class MyoHandPourEnv:
         # project notes -- bps_torch/chamfer_distance/pytorch3d chain
         # computed in the physgraph env, bridged via portable pickle,
         # zero bps_torch dependency needed here)
-        with open(os.path.join(repo_root, "assets/retargeted/1292e_src_mug_bps.pkl"), "rb") as f:
+        with open(os.path.join(repo_root, "assets/retargeted", os.environ.get("MYOHAND_SRC_BPS", "1292e_src_mug_bps.pkl")), "rb") as f:
             self.src_mug_bps = torch.tensor(pickle.load(f), device=self.device, dtype=torch.float32)[0]
         with open(os.path.join(repo_root, "assets/retargeted/1292e_dst_mug_bps.pkl"), "rb") as f:
             self.dst_mug_bps = torch.tensor(pickle.load(f), device=self.device, dtype=torch.float32)[0]
@@ -926,6 +941,29 @@ class MyoHandPourEnv:
         diff_eef_rot = quat_mul(target_eef_quat, quat_conjugate(current_eef_quat))
         diff_eef_rot_angle = quat_to_angle(diff_eef_rot)
         reward_eef_rot = torch.exp(-1 * diff_eef_rot_angle.abs())
+        # === fingertip orientation reward (pad vs back): distal-phalanx rotation vs the demo's, from FK over the demo ===
+        _tr_w = float(os.environ.get("MYOHAND_TIPROT_W", "1.0"))
+        _tr_k = float(os.environ.get("MYOHAND_TIPROT_K", "2.0"))
+        if not hasattr(self, "_tip_q_tgt"):
+            _d = mujoco.MjData(self.mj_model)
+            _wp = self.demo_opt_wrist_pos.cpu().numpy().astype(np.float64)
+            _wq = self.demo_opt_wrist_quat.cpu().numpy().astype(np.float64)
+            _dq0 = self.demo_opt_dof_pos.cpu().numpy().astype(np.float64)
+            _tb = np.asarray(self.tip_body_ids)
+            _out = np.zeros((_wp.shape[0], len(_tb), 4))
+            for _t in range(_wp.shape[0]):
+                _d.qpos[:] = self.mj_model.qpos0
+                _d.qpos[self.root_adr:self.root_adr + 3] = _wp[_t]
+                _d.qpos[self.root_adr + 3:self.root_adr + 7] = _wq[_t]
+                _d.qpos[np.asarray(self.dof_adrs)] = _dq0[_t]
+                mujoco.mj_kinematics(self.mj_model, _d)
+                _out[_t] = _d.xquat[_tb]
+            self._tip_q_tgt = torch.tensor(_out, dtype=torch.float32, device=self.device)
+        _tq = wp.to_torch(self.data.xquat)[:, self.tip_body_ids]
+        _tt = self._tip_q_tgt[torch.clamp(cur_idx, max=self._tip_q_tgt.shape[0] - 1)]
+        _dqr = quat_mul(_tt.reshape(-1, 4), quat_conjugate(_tq.reshape(-1, 4)))
+        tip_rot_angle = (2 * torch.acos(_dqr[:, 0].abs().clamp(max=1.0))).reshape(-1, len(self.tip_body_ids))
+        reward_tip_rot = torch.exp(-_tr_k * tip_rot_angle).mean(-1)
 
         diff_obj_pos_dist = torch.norm(target_obj_pos - current_obj_pos, dim=-1)
         reward_obj_pos = torch.exp(-80 * diff_obj_pos_dist)
@@ -954,6 +992,7 @@ class MyoHandPourEnv:
             "level_1": diff_level_1_pos_dist, "level_2": diff_level_2_pos_dist,
             "obj_rot_deg": diff_obj_rot_angle.abs() / np.pi * 180,
             "tip_force_sum": tip_force_sum,
+            "tip_rot_deg": tip_rot_angle.mean(-1) * 180.0 / np.pi,
             "contact_fail": contact_fail.float(),
             "power": power,
             "wrist_power": wrist_power,
@@ -984,6 +1023,7 @@ class MyoHandPourEnv:
             + 0.05 * reward_eef_ang_vel + 0.1 * reward_joints_vel
             + 0.1 * reward_obj_vel + 0.1 * reward_obj_ang_vel
             + float(os.environ.get("MYOHAND_FORCE_REWARD_W", "0.0")) * reward_finger_tip_force
+            + _tr_w * reward_tip_rot
             + 0.5 * reward_power + 0.5 * reward_wrist_power
         )
 
@@ -1031,6 +1071,7 @@ class MyoHandPourEnv:
                 "reward_obj_vel": reward_obj_vel,
                 "reward_obj_ang_vel": reward_obj_ang_vel,
                 "reward_finger_tip_force": reward_finger_tip_force,
+                "reward_tip_rot": reward_tip_rot,
                 "reward_power": reward_power,
                 "reward_wrist_power": reward_wrist_power,
             },
