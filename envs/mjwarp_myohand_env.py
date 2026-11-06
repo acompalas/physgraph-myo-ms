@@ -964,6 +964,19 @@ class MyoHandPourEnv:
         _dqr = quat_mul(_tt.reshape(-1, 4), quat_conjugate(_tq.reshape(-1, 4)))
         tip_rot_angle = (2 * torch.acos(_dqr[:, 0].abs().clamp(max=1.0))).reshape(-1, len(self.tip_body_ids))
         reward_tip_rot = torch.exp(-_tr_k * tip_rot_angle).mean(-1)
+        _jq_w = float(os.environ.get("MYOHAND_JQ_W", "2.0"))
+        _jq_lam = float(os.environ.get("MYOHAND_JQ_LAMBDA", "10.0"))  # per rad of weighted-mean excess
+        _jq_dz = np.radians(float(os.environ.get("MYOHAND_JQ_DEADZONE_DEG", "6.0")))
+        if not hasattr(self, "_jq_wvec"):
+            _mult = float(os.environ.get("MYOHAND_JQ_THUMB_RING_MULT", "2.0"))
+            _hi = {"cmc_flexion_r", "cmc_abduction_r", "mp_flexion_r", "ip_flexion_r",
+                   "mcp4_flexion_r", "mcp4_abduction_r", "pm4_flexion_r", "md4_flexion_r"}
+            _wv = torch.tensor([_mult if n in _hi else 1.0 for n in self.dof_names], device=self.device, dtype=torch.float32)
+            self._jq_wvec = _wv / _wv.sum()
+        _q_cur = wp.to_torch(self.data.qpos)[:, self.dof_adrs]
+        _q_tgt = self.demo_opt_dof_pos[torch.clamp(cur_idx, max=self.demo_opt_dof_pos.shape[0] - 1)]
+        _jq_excess = torch.clamp((_q_cur - _q_tgt).abs() - _jq_dz, min=0.0)
+        reward_joint_q = torch.exp(-_jq_lam * (_jq_excess * self._jq_wvec).sum(-1))
 
         diff_obj_pos_dist = torch.norm(target_obj_pos - current_obj_pos, dim=-1)
         reward_obj_pos = torch.exp(-80 * diff_obj_pos_dist)
@@ -1024,6 +1037,7 @@ class MyoHandPourEnv:
             + 0.1 * reward_obj_vel + 0.1 * reward_obj_ang_vel
             + float(os.environ.get("MYOHAND_FORCE_REWARD_W", "0.0")) * reward_finger_tip_force
             + _tr_w * reward_tip_rot
+            + _jq_w * reward_joint_q
             + 0.5 * reward_power + 0.5 * reward_wrist_power
         )
 
@@ -1072,6 +1086,7 @@ class MyoHandPourEnv:
                 "reward_obj_ang_vel": reward_obj_ang_vel,
                 "reward_finger_tip_force": reward_finger_tip_force,
                 "reward_tip_rot": reward_tip_rot,
+                "reward_joint_q": reward_joint_q,
                 "reward_power": reward_power,
                 "reward_wrist_power": reward_wrist_power,
             },
