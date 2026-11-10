@@ -818,7 +818,21 @@ class MyoHandPourEnv:
         xpos = wp.to_torch(self.data.xpos)  # (nworld, nbody, 3)
 
         cur_idx = self.progress_buf
-        scale_factor = 1.0
+        _tm = os.environ.get("MYOHAND_TIGHTEN_METHOD", "exp_decay")
+        _tf = float(os.environ.get("MYOHAND_TIGHTEN_FACTOR", "0.7"))
+        _ts = float(os.environ.get("MYOHAND_TIGHTEN_STEPS", "3200"))
+        self._tight_step = getattr(self, "_tight_step", 0) + 1
+        _ls = self._tight_step + int(os.environ.get("MYOHAND_TIGHTEN_OFFSET", "0"))
+        if _tm == "None":
+            scale_factor = 1.0
+        elif _tm == "const":
+            scale_factor = _tf
+        elif _tm == "linear_decay":
+            scale_factor = 1 - (1 - _tf) / _ts * min(_ls, _ts)
+        elif _tm == "exp_decay":
+            scale_factor = (np.e * 2) ** (-1 * _ls / _ts) * (1 - _tf) + _tf
+        else:
+            raise NotImplementedError(_tm)
 
         # === current sim state ===
         current_eef_pos = qpos[:, self.root_adr:self.root_adr + 3]
@@ -966,10 +980,11 @@ class MyoHandPourEnv:
         reward_tip_rot = torch.exp(-_tr_k * tip_rot_angle).mean(-1)
         _jq_w = float(os.environ.get("MYOHAND_JQ_W", "1.0"))
         _jq_lam = float(os.environ.get("MYOHAND_JQ_LAMBDA", "10.0"))
-        _lim_w = float(os.environ.get("MYOHAND_LIM_W", "1.0"))
-        _lim_lam = float(os.environ.get("MYOHAND_LIM_LAMBDA", "5.0"))
-        _ffs_w = float(os.environ.get("MYOHAND_FFSP_W", "1.0"))
-        _ffs_lam = float(os.environ.get("MYOHAND_FFSP_LAMBDA", "100.0"))
+        _jq_lamw = float(os.environ.get("MYOHAND_JQ_LAMBDA_WIDE", "2.0"))
+        _lim_w = float(os.environ.get("MYOHAND_LIM_W", "2.0"))
+        _lim_cap = float(os.environ.get("MYOHAND_LIM_CAP", "0.75"))
+        _ffs_w = float(os.environ.get("MYOHAND_FFSP_W", "2.0"))
+        _ffs_cap = float(os.environ.get("MYOHAND_FFSP_CAP_MM", "30")) / 1000.0
         if not hasattr(self, "_jq_M"):
             import mujoco as _mj
             _m = self.mj_model
@@ -1002,19 +1017,36 @@ class MyoHandPourEnv:
                 [float(os.environ.get("MYOHAND_JQ_W_WRIST", "0.3")), float(os.environ.get("MYOHAND_JQ_W_THUMB", "1.0"))]
                 + [float(os.environ.get("MYOHAND_JQ_W_FINGER", "0.5"))] * 4, device=self.device)
             self._ffs_margin = [float(x) / 1000.0 for x in os.environ.get("MYOHAND_FFSP_MARGIN_MM", "14,12.5,12.5").split(",")]
+            self._ffs_dfrac = float(os.environ.get("MYOHAND_FFSP_DEMO_FRAC", "0.7"))
+            self._ffs_gfrac = float(os.environ.get("MYOHAND_FFSP_GAP_FRAC", "0.5"))
             print("[jq] group sizes", _M.sum(0).tolist(), "| abduction dofs", [n for n in _names if "abduction" in n], flush=True)
         _q_cur = wp.to_torch(self.data.qpos)[:, self.dof_adrs]
         _q_tgt = self.demo_opt_dof_pos[torch.clamp(cur_idx, max=self.demo_opt_dof_pos.shape[0] - 1)]
         _jq_excess = torch.clamp((_q_cur - _q_tgt).abs() - self._jq_dz, min=0.0)
-        reward_joint_q = (torch.exp(-_jq_lam * (_jq_excess @ self._jq_M)) * self._jq_gw).sum(-1)
-        reward_limit = torch.exp(-_lim_lam * (torch.clamp(self._lim_lo - _q_cur, min=0.0)
-                                              + torch.clamp(_q_cur - self._lim_hi, min=0.0)).sum(-1))
+        _jq_e = _jq_excess @ self._jq_M
+        reward_joint_q = ((0.5 * torch.exp(-_jq_lam * _jq_e) + 0.5 * torch.exp(-_jq_lamw * _jq_e)) * self._jq_gw).sum(-1)
+        _over = torch.clamp(self._lim_lo - _q_cur, min=0.0) + torch.clamp(_q_cur - self._lim_hi, min=0.0)
+        reward_limit = 1.0 - torch.clamp(_over.sum(-1) / _lim_cap, 0.0, 1.0)
+        _J = joints_pos
+        _T = target_joints_pos
         _short = torch.zeros(self.num_envs, device=self.device)
         for _a in (1, 2, 3):
+            for _l1 in (1, 2, 3):
+                for _l2 in (1, 2, 3):
+                    _d = torch.norm(_J[:, 4 * _a + _l1] - _J[:, 4 * (_a + 1) + _l2], dim=-1)
+                    _dd = torch.norm(_T[:, 4 * _a + _l1] - _T[:, 4 * (_a + 1) + _l2], dim=-1)
+                    _mg = torch.clamp(self._ffs_dfrac * _dd, max=min(self._ffs_margin[_l1 - 1], self._ffs_margin[_l2 - 1]))
+                    _short = _short + torch.clamp(_mg - _d, min=0.0)
+        _uc = _J[:, 16] - _J[:, 4]
+        _uc = _uc / _uc.norm(dim=-1, keepdim=True).clamp(min=1e-6)
+        _ut = _T[:, 16] - _T[:, 4]
+        _ut = _ut / _ut.norm(dim=-1, keepdim=True).clamp(min=1e-6)
+        for _a in (1, 2, 3):
             for _l in (1, 2, 3):
-                _dj = torch.norm(joints_pos[:, 4 * _a + _l] - joints_pos[:, 4 * (_a + 1) + _l], dim=-1)
-                _short = _short + torch.clamp(self._ffs_margin[_l - 1] - _dj, min=0.0)
-        reward_ffspace = torch.exp(-_ffs_lam * _short)
+                _g = ((_J[:, 4 * (_a + 1) + _l] - _J[:, 4 * _a + _l]) * _uc).sum(-1)
+                _gd = ((_T[:, 4 * (_a + 1) + _l] - _T[:, 4 * _a + _l]) * _ut).sum(-1)
+                _short = _short + torch.clamp(self._ffs_gfrac * _gd - _g, min=0.0)
+        reward_ffspace = 1.0 - torch.clamp(_short / _ffs_cap, 0.0, 1.0)
 
         diff_obj_pos_dist = torch.norm(target_obj_pos - current_obj_pos, dim=-1)
         reward_obj_pos = torch.exp(-80 * diff_obj_pos_dist)
